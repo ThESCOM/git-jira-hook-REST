@@ -1,0 +1,408 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+# Copyright (c) 2012 Max Oberberger (max@oberbergers.de)
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the 
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License 
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Version 3.0
+#
+###########################################################################
+
+# Purpose:
+# This is a git hook, to be used in an environment where git is used
+# as the source control and Jira is used for bug tracking.
+
+import logging
+import sys
+import os
+import re
+import subprocess
+import string
+from subprocess import Popen, PIPE # , call
+from jira.client import JIRA
+
+scriptName = os.path.basename(sys.argv[0])
+
+## adapt the number
+## cd into .git-folder -> call python -> import os -> call this function and adapt number (deprecated)
+REPO_NAME = os.getcwd().rsplit('/', 1)[-1].split('.')[0]
+GIT_PATH = '/usr/bin/git'
+MAIL = "(@oberbergers.de|@localhost)"
+
+JIRA_URL = 'https://chiemseesurfer.atlassian.net'
+USERNAME = 'username'
+PASSWORD = 'password'
+JIRA_ID = 'JIRA'
+JIRA_FIXED = 'Done'
+
+
+# Change this value to "CRITICAL/ERROR/WARNING/INFO/DEBUG/NOTSET"
+# as appropriate.
+loglevel=logging.INFO
+#loglevel=logging.DEBUG
+
+## Main Method
+#
+# The hook is called as 
+#     * update
+#     * post-receive
+#     * pre-receive
+def main():
+    global scriptName, loglevel
+    logging.basicConfig(level=loglevel, format=scriptName + ":%(levelname)s: %(message)s")
+
+    if scriptName == "update":
+        return handle_update()
+
+    elif scriptName == "post-receive":
+        return handle_post_receive()
+
+    elif scriptName == "pre-receive":
+    	return handle_pre_receive()
+
+    else:
+        logging.error("invoked as '%s'. Need to be invoked as update, pre-receive or post-receive" , scriptName)
+        return -1
+
+## call git in command line
+def call_git(command, args, input=None):
+    return Popen([GIT_PATH, command] + args, stdin=PIPE, stdout=PIPE).communicate(input)[0]
+
+## extract new commits
+def get_new_commits(ref_updates):
+    """ Gets a list of updates from git running post-receive,
+    we want the list of new commits to the repo, that are part
+    of the push. Even if they are in more then one ref in the push.
+
+    Basically, we are running:
+    git rev-list new1 ^old1 new2 ^old2 ^everything_else
+
+    It returns a list of commits"""
+
+    all_refs = set(call_git('for-each-ref', ['--format=%(refname)']).splitlines())
+    commands = []
+    for old, new, ref in ref_updates:
+        # branch delete, skip it
+        if re.match('0*$', new):
+            continue
+
+        commands += [new]
+        all_refs.discard(ref)
+
+        if not re.match('0*$', old):
+            # update
+            commands += ["^%s" % old]
+        # else: new - do nothing more
+
+    for ref in all_refs:
+        commands += ["^%s" % ref]
+
+    new_commits = call_git('rev-list', ['--stdin', '--reverse'], '\n'.join(commands)).splitlines()
+    return new_commits
+
+# before another git-call is done,
+# check if mailadress and username is correct
+def handle_pre_receive():
+    lines = sys.stdin.readlines()
+    updates = [line.split() for line in lines]
+    commits = get_new_commits(updates)
+    for i in commits:
+	    ## check if root wants to commit
+        # %cn commiter name
+        # -s  short information (hyde deleted and added file names)
+	    name = call_git('show',['-s', '--format=%cn','--summary',i])
+	    if re.search("root", name, re.IGNORECASE):
+		    print "you are commiting as " + name + " - that is not allowed"
+		    return -1
+
+	    ## check if email is in range
+        # %ce commiter email
+        # -s  short information (hyde deleted and added file names)
+	    mail = call_git('show',['-s', '--format=%ce','--summary',i])
+	    if not re.search(MAIL, mail):
+		    print "email address " + mail + " is not allowed you need a mail-adress like muster" + MAIL
+		    return -1
+
+# Performs the git "update" hook
+# This hook is triggered on the remote repo, as a result
+# of "git push"
+# Parses the old and new commit IDs from argv[2] and argv[3]
+# argv[1] contains the "refname"
+def handle_update():
+    if len(sys.argv) < 4:
+        logging.error("update hook called with incorrect no. of parameters")
+        return -1
+
+    ref = sys.argv[1] # This is of the form "refs/heads/<branchname>"
+    old_commit_id = sys.argv[2]
+    new_commit_id = sys.argv[3]
+
+    (result, commit_id_array) = handleNewAndDeletedBranches(new_commit_id, old_commit_id, ref)
+
+    if result == -1:
+        return -1
+    elif result == 0 and commit_id_array == None:
+        return 0
+
+    jira = connect_to_jira()
+
+    if jira == None:
+        return -1
+
+    for commit_id in commit_id_array:
+        commit_text = git_get_commit_msg(commit_id)
+ 
+        if validate_commit_text(jira, commit_text, commit_id) != 0:
+            return -1
+
+    return 0
+
+# post-receive hook is called with no parameters
+# but STDIN has <old-commit-id> <new-commit-id> <refname>
+def handle_post_receive():
+    buf = sys.stdin.read()
+    logging.debug("handle_post_receive: stdin='%s'", buf)
+    (old_commit_id, new_commit_id, ref) =  string.split(buf, ' ')
+
+
+    if old_commit_id == None or new_commit_id == None or ref == None:
+        logging.error("post-receive hook stdin is incorrect '%s'", buf)
+        return -1
+
+    (result, commit_id_array) = handleNewAndDeletedBranches(new_commit_id, old_commit_id, ref)
+
+    if result == -1:
+        return -1
+    elif result == 0 and commit_id_array == None:
+        return 0
+
+    jira = connect_to_jira()
+
+    if jira == None:
+        return -1
+
+    for commit_id in commit_id_array:
+        author = git_get_committer(commit_id).rstrip('\n')
+        authorMail = "<" + git_get_committerMail(commit_id).rstrip('\n') + ">\n\n"
+        commit_text = author + " " + authorMail + git_get_commit_msg(commit_id).rstrip('\n')
+        jira_add_comment(jira, commit_id, commit_text, ref)
+
+    return 0
+
+def handleNewAndDeletedBranches(new_commit_id, old_commit_id, ref):
+    if not enabled_on_branch(git_get_branchname_from_ref(ref)):
+        return 0
+
+    ## Handle new and deleted branches
+    # if repository is empty, the first commit-id contains just 0
+    zeros = '0000000000000000000000000000000000000000'
+    if new_commit_id == zeros:
+        logging.debug('branch at %s deleted' % old_commit_id)
+        return (0, None)
+
+    if old_commit_id == zeros:
+        logging.debug('new branch at %s' % new_commit_id)
+        commit_id_array = [new_commit_id]
+    else:
+        commit_id_array = git_get_array_of_commit_ids(old_commit_id, new_commit_id)
+
+    if commit_id_array == None or len(commit_id_array)==0:
+        logging.error("no commit ids!")
+        return (-1, None)
+
+    return (0, commit_id_array)
+
+
+def validate_commit_text(jira, commit_text, commit_id=None):
+    refed_issue_count = call_pattern_hook(commit_text, \
+            jira_find_issue, jira, None)
+
+    if refed_issue_count == -1:
+	    return -1
+
+    if refed_issue_count == 0:
+        if re.search("(Merge branch '|Merge remote branch ')", commit_text):
+            return 0
+        if commit_id != None:
+            logging.error("Failed to find any referenced Jira issue\n\tin commit message for commit %s", commit_id)
+        else:
+            logging.error("Failed to find any referenced Jira issue in commit message(s)")
+        return -1
+
+    return 0
+
+## add a comment to jira.
+# modify comment-message to contain git.turtle url
+def jira_add_comment(jira, commit_id, commit_text, ref):
+    commit_text_with_url = "commit-ID: http:///gitweb.url/" + REPO_NAME \
+    + "/commitdiff/" + commit_id \
+        + "\non Branch: " + git_get_branchname_from_ref(ref) + "\n" + commit_text.rstrip('\n')
+
+    call_pattern_hook(commit_text, jira_add_comment_to_issue, jira, commit_text_with_url)
+    return 0
+ 
+##
+# Given a function pointer, iterates through the commit message
+# text for Jira magic words, and calls the function repeatedly
+# returns number of issues found and touched
+# in case of error, return -1
+def call_pattern_hook(text, hookfn, jira, jira_text):
+    if not callable(hookfn):
+        logging.error("Hook function is not callable");
+        sys.exit(-1)
+
+    magic = re.compile('%s-\d\d*' % JIRA_ID)
+
+    iterator = magic.finditer(text)
+
+    issue_count = 0
+    for match in iterator:
+        issuekey = match.group()
+        logging.debug("issuekey found = %s", issuekey)
+        ret = hookfn(issuekey, jira, jira_text)
+        if ret != 0:
+            return -1
+
+        logging.debug('Solution: %s', jira.issue(issuekey).fields.status)
+        if str(jira.issue(issuekey).fields.status) == JIRA_FIXED:
+            logging.error("Jira issue %s already closed.", issuekey)
+            return -1
+        issue_count += 1
+
+    return issue_count
+
+
+#-----------------------------------------------------------------------------
+# Jira helper functions
+#
+
+def jira_find_issue(issuekey, jira, jira_text):
+    try:
+        issue = jira.issue(issuekey)
+        return 0
+
+    except Exception, e:
+        logging.error("No such issue '%s' in Jira", issuekey)
+        logging.debug(e)
+        return -1
+
+
+def jira_add_comment_to_issue(issuekey, jira, jira_text):
+
+    text = jira_text
+    try:
+        # fix problem with umlaute 
+        text = jira_text.decode('utf-8')
+    except UnicodeDecodeError as ue:
+	    logging.debug("ASCII, UTF-8 error in jira_add_comment_to_issue %s", text)
+	    logging.debug(ue)
+	    logging.info("Error with German Umlaute in commit message. The repo will be updatet, but you will see no comment in Jira Issue")
+	    return 0
+
+    try:
+        jira.add_comment(jira.issue(issuekey), text)
+        logging.debug("Added to issue '%s' in Jira:\n%s", issuekey, jira_text)
+	return 0
+
+    except Exception, e:
+        logging.error("Error adding comment to issue '%s' in Jira", issuekey)
+	logging.debug("Your Textmessage: %s", jira_text)
+	logging.debug("Encoded Textmessage: %s", jira_text.decode('utf-8'))
+    logging.debug(e)
+    return -1
+
+
+#-----------------------------------------------------------------------------
+# Miscellaneous Jira related utility functions
+#
+def connect_to_jira():
+    jira_options = { 'server': JIRA_URL}
+
+    try:
+        jira = JIRA(options=jira_options, basic_auth=(USERNAME, PASSWORD))
+    except Exception as e:
+        jira = None
+
+    return jira
+
+#----------------------------------------------------------------------------
+# git helper functions
+#
+
+# Read git config of "git-jira-hook.branches"
+# Parse out the comma (and space) separated list of
+# branch names.
+# Then compare against current branchname to see
+# if we need to be enabled.
+# Return False if we should not be enabled
+def enabled_on_branch(current_branchname):
+    logging.debug("Test if '%s' is enabled...", current_branchname)
+
+    if current_branchname is None:
+	    return False
+
+    return not False
+
+# Given a "ref" string (such as while doing a push
+# to a remote repo), parse out the branch name
+def git_get_branchname_from_ref(ref):
+    # allow git tags
+    if ref.startswith("refs/tags/"):
+	    return None
+
+    # "refs/heads/<branchname>"
+    elif not ref.startswith("refs/heads"):
+        logging.error("Invalid ref '%s'", ref)
+        sys.exit(-1)
+
+    return string.strip(ref[len("refs/heads/"):])
+
+def git_get_committer(commit_id):
+    # cn = commiter name
+    return "Author: " + call_git('show',['-s', '--format=%cn','--summary', commit_id])
+
+def git_get_committerMail(commit_id):
+    # ce = commiter email
+    return call_git('show',['-s', '--format=%ce', '--summary', commit_id])
+
+def git_get_commit_msg(commit_id):
+    # b = body
+    # n = newline
+    # s = subject
+    return call_git('show',['--format=%s%n%b', '--summary', commit_id])
+
+def get_shell_cmd_output(cmd):
+    try:
+    	proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE)
+	return proc.stdout.read().rstrip('\n')
+
+    except Exception, e:
+	logging.error("Failed trying to execute '%s'", cmd)
+
+def git_get_array_of_commit_ids(start_id, end_id):
+    logging.debug("start_id: %s",start_id)
+    logging.debug("end_id: %s",end_id)
+    output = get_shell_cmd_output("git rev-list --reverse " + start_id + ".." + end_id)
+    if output == "":
+        return None
+ 
+    # parse the result into an array of strings
+    commit_id_array = string.split(output, '\n')
+    return commit_id_array
+ 
+#----------------------------------------------------------------------------
+# python script entry point. Dispatches main()
+if __name__ == "__main__":
+  sys.exit (main())
