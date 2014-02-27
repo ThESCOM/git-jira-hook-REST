@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 #
-# Copyright (c) 2012 Max Oberberger (max@oberbergers.de)
+# Copyright (c) 2014 Max Oberberger (max@oberbergers.de)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
-# 
+#
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the 
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 # GNU General Public License for more details.
-# 
-# You should have received a copy of the GNU General Public License 
+#
+# You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 # Version 3.0
@@ -44,7 +44,6 @@ MAIL = "(@oberbergers.de|@localhost)"
 JIRA_URL = 'https://chiemseesurfer.atlassian.net'
 USERNAME = 'username'
 PASSWORD = 'password'
-JIRA_ID = 'JIRA'
 JIRA_FIXED = 'Done'
 
 
@@ -252,7 +251,7 @@ def jira_add_comment(jira, commit_id, commit_text, ref):
 
     call_pattern_hook(commit_text, jira_add_comment_to_issue, jira, commit_text_with_url)
     return 0
- 
+
 ##
 # Given a function pointer, iterates through the commit message
 # text for Jira magic words, and calls the function repeatedly
@@ -263,7 +262,7 @@ def call_pattern_hook(text, hookfn, jira, jira_text):
         logging.error("Hook function is not callable");
         sys.exit(-1)
 
-    magic = re.compile('%s-\d\d*' % JIRA_ID)
+    magic = re.compile('\w+-\d+')
 
     iterator = magic.finditer(text)
 
