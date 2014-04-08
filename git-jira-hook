@@ -202,7 +202,7 @@ def handle_post_receive():
 
 def handleNewAndDeletedBranches(new_commit_id, old_commit_id, ref):
     if not enabled_on_branch(git_get_branchname_from_ref(ref)):
-        return 0
+        return (0, None)
 
     ## Handle new and deleted branches
     # if repository is empty, the first commit-id contains just 0
